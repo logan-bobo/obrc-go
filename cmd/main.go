@@ -12,7 +12,9 @@ import (
 
 func main() {
 	var dataFile string
+	var processingConcurrency int
 	flag.StringVar(&dataFile, "data-file", "data/weather_stations.csv", "measurement file for processing")
+	flag.IntVar(&processingConcurrency, "pc", 1, "gorountines used for concurrent processing")
 	flag.Parse()
 
 	file, err := os.Open(dataFile)
@@ -22,7 +24,11 @@ func main() {
 	}
 	defer file.Close()
 
-	measurements := data.Process(file)
+	measurements, err := data.Process(file, processingConcurrency)
+	if err != nil {
+		log.Println(err)
+		os.Exit(1)
+	}
 
 	keys := make([]string, 0, len(measurements))
 

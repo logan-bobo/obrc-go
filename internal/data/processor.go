@@ -1,13 +1,12 @@
 package data
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type metadata struct {
@@ -30,57 +29,156 @@ func NewMetadata(seed float64) *metadata {
 
 type measurements map[string]*metadata
 
+type chunkedMeassurements []measurements
+
 func (m *metadata) String() string {
 	return fmt.Sprintf("%.1f;%.1f;%.1f", m.min, m.rollingMean, m.max)
 }
 
-func Process(data *os.File) measurements {
-	scanner := bufio.NewScanner(data)
+func Process(data *os.File, pc int) (measurements, error) {
+	fileStats, err := data.Stat()
+	if err != nil {
+		log.Println(err)
+		return measurements{}, err
+	}
 
-	measurements := measurements{}
+	chunker := NewChunker(fileStats.Size(), pc)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	// preallocate the chunked measurementsas this has a 1:1 mapping with
+	// the amount of chunks to process
+	cm := make(chunkedMeassurements, len(chunker.Chunks))
+	for i := range cm {
+		cm[i] = make(measurements)
+	}
 
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
+	var wg sync.WaitGroup
 
-		// ; represents the difference between our region and temprature
-		// for example Hamburg;34.2
-		parts := strings.Split(line, ";")
+	for index, chunk := range chunker.Chunks {
+		wg.Add(1)
+		go func(index int, chunk ChunkInfo) {
+			defer wg.Done()
+			measurements := cm[index]
 
-		if len(parts) != 2 {
-			log.Println(errors.New("invalid temperature measurement length exiting"))
-			os.Exit(1)
-		}
+			// gives us the length of the chunk
+			bytesToRead := chunk.End - chunk.Start
+			buffer := make([]byte, (bytesToRead + 128))
 
-		region := parts[0]
-		temp, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			log.Println(err)
-			os.Exit(1)
-		}
+			n, _ := data.ReadAt(buffer, chunk.Start)
+			buffer = buffer[:n]
 
-		r, ok := measurements[region]
-		if !ok {
-			measurements[region] = NewMetadata(temp)
-		} else {
-			r.cumulativeTotal += temp
-			r.count += 1
+			bytesProcessed := 0
 
-			if temp < r.min {
-				r.min = temp
+			// we could be in the middle of a line here so we need to read forward
+			// this works because we always read forward so the previous chunk
+			// would have processed this data.
+			if chunk.Start > 0 {
+				for i := 0; i < len(buffer); i++ {
+					if buffer[i] == '\n' {
+						bytesProcessed = i + 1
+						break
+					}
+				}
 			}
 
-			if temp > r.max {
-				r.max = temp
+			for i := bytesProcessed; i < len(buffer); i++ {
+				if buffer[i] == '\n' {
+					line := string(buffer[bytesProcessed:i])
+
+					if line == "" || strings.HasPrefix(line, "#") {
+						bytesProcessed = i + 1
+						continue
+					}
+
+					if i > int(bytesToRead) {
+						processLineData(measurements, line)
+						break
+					}
+
+					processLineData(measurements, line)
+
+					bytesProcessed = i + 1
+				}
 			}
 
-			mean := r.cumulativeTotal / r.count
-			r.rollingMean = mean
+			// the last chunk may contain data past the last newline as
+			// the file might not end with a new line this would result in
+			// data being missed
+			if index == len(chunker.Chunks)-1 {
+				line := string(buffer[bytesProcessed:])
+
+				if line != "" && !strings.HasPrefix(line, "#") {
+					processLineData(measurements, line)
+				}
+			}
+		}(index, chunk)
+	}
+	wg.Wait()
+
+	return mergeMeasurements(cm), nil
+}
+
+func processLineData(measurements measurements, line string) {
+	// ; represents the difference between our region and temprature
+	// for example Hamburg;34.2
+	parts := strings.Split(line, ";")
+
+	if len(parts) != 2 {
+		log.Printf("Parts: %v", parts)
+		os.Exit(1)
+	}
+
+	region := parts[0]
+	temp, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		log.Println(err)
+		os.Exit(1)
+	}
+
+	r, ok := measurements[region]
+	if !ok {
+		measurements[region] = NewMetadata(temp)
+	} else {
+		r.cumulativeTotal += temp
+		r.count += 1
+
+		if temp < r.min {
+			r.min = temp
+		}
+
+		if temp > r.max {
+			r.max = temp
+		}
+
+		mean := r.cumulativeTotal / r.count
+		r.rollingMean = mean
+	}
+}
+
+func mergeMeasurements(cm chunkedMeassurements) measurements {
+	totals := measurements{}
+
+	for _, m := range cm {
+		for key, value := range m {
+			r, ok := totals[key]
+			if !ok {
+				totals[key] = value
+			} else {
+				r.cumulativeTotal += value.cumulativeTotal
+				r.count += 1
+
+				if value.min < r.min {
+					r.min = value.min
+				}
+
+				if value.max > r.max {
+					r.max = value.max
+				}
+
+				mean := r.cumulativeTotal / r.count
+				r.rollingMean = mean
+			}
 		}
 	}
 
-	return measurements
+	return totals
 }
